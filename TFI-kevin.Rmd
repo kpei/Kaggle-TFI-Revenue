@@ -1,0 +1,520 @@
+---
+title: "Tab Food Investment Analysis"
+author: "Kevin Pei"
+date: "Tuesday, April 14, 2015"
+output: html_document
+---
+
+```{r, echo=FALSE}
+pkg <- c("caret","randomForest", "neuralnet", "nnet", "kernlab", "gbm", "cclust", "FNN", "rggobi")
+install.packages(pkg)
+lapply(pkg,function(x){library(x,character.only=TRUE)}) 
+
+setwd("G:\\STAT5703\\Takehome")
+setwd("C:\\Users\\Kevin Pei\\Desktop\\stat5703 DB\\final")
+train<- read.csv("train.csv")
+test<-read.csv("test.csv")
+```
+
+Analysis of Data
+----------------------------
+
+Visualization
+=========================
+
+Revenue histogram
+```{r}
+
+revenue <- train[,43]/1000000
+par(mfrow=c(1,2))
+pnorm.rev <- format(shapiro.test(revenue)$p.value,digits=2) #Normality Test using Shapiro-Wilks Test
+pnorm.logrev <- format(shapiro.test(log(revenue))$p.value,digits=2)
+hist(revenue, breaks=40, main=paste("Histogram of Revenue \n P-Value: ",pnorm.rev), xlab="Revenue (Millions)", ylab="Frequency")
+hist(log(revenue), breaks=40, main=paste("Histogram of ln(Revenue) \n P-Value: ",pnorm.logrev), xlab="Revenue (Millions)", ylab="Frequency")
+````
+
+```{r}
+d.comb <- rbind(train[,-43],test)
+d.comb <- d.comb[,c(-1)]
+d.comb$Open.Date <- as.numeric(as.POSIXlt("01/01/2015", format="%m/%d/%Y") - as.POSIXlt(d.comb$Open.Date, format="%m/%d/%Y"))
+source("pairs_ext.r")
+
+par(mar=c(1,1,1,1))
+pairs(x.train[,-c(1:15)], upper.panel=panel.cor, diag.panel=panel.hist)
+
+g <- ggobi(cbind(x.train,y.train))
+```
+Something's weird with the parallel coordinates plot where some variables are zero, lets investigate
+```{r}
+a <- apply(x.train[,-c(1:4)],2,function(x){sum(x == 0)})
+a
+x.train.mystery <- cbind(x.train[x.train$P14 == 0,],y.train[which(x.train$P14 == 0)])
+
+g <- ggobi(x.train.mystery)
+
+```
+0 means missing data and it takes up most of the fucking training set.  Does this persist in the test?
+```{r}
+
+#Get a subset of test cause its huge
+mystery.ind <- createDataPartition(y = x.test[,1], p = 0.025, list = FALSE)
+x.test.mystery <- x.test[mystery.ind,]
+mg <- ggobi(x.test.mystery)
+a <- apply(x.test.mystery[,-c(1:4)],2,function(x){sum(x == 0)})
+a
+```
+Still persists, lets fix that..
+
+
+The "Zero" Problem
+==========================
+
+First, lets try KNN to classify P14-18, P24-27, P30-37
+```{r}
+  q.col <- c(18:22,28:31,34:41) #Columns listed above
+  
+  # get a row index of ONLY zeros in our q.col
+  ind <- apply(x.train[,q.col] == 0, 1, function(x){
+    all(x)
+  })
+  ind <- which(ind)
+  parsed <- x.train[-ind, -c(1:4, q.col)]  #1:4 represents removing non-numeric
+  query <- x.train[ind,-c(1:4, q.col)]
+
+  knn <- knnx.index(parsed, query, k=1)
+  fix <- x.train[-ind,q.col][knn,] # Get the nearest neighbouring value of P
+
+  x.train[ind,q.col] <- fix
+
+ # OLD ONE, TAKES A LONG TIME ###############################
+  for (i in 1:length(q.col)){
+    x <- x.train[,q.col[i]] # Get the ith column
+    
+    ind <- which(x==0)
+    parsed <- x.train[-ind, -c(1:4, q.col)]  #1:4 represents removing non-numeric
+    query <- x.train[ind,-c(1:4, q.col)]
+    
+    knn <- knnx.index(parsed, query, k=5)
+    knn <- apply(knn, 1, function(x){mean(x.train[-ind,q.col][x,i])}) #Get the mean from the parsed KNN indices
+    
+    x.train[ind,q.col[i]] <- knn
+  }
+
+# Apply to test set
+for (i in 1:length(q.col)) {
+    x <- x.test[,q.col[i]] # Get the ith column
+    
+    ind <- which(x==0)
+    parsed <- x.test[-ind, -c(1:4, q.col)]  #1:4 represents removing non-numeric
+    query <- x.test[ind,-c(1:4, q.col)]
+    
+    knn <- knnx.index(parsed, query, k=5)
+    knn <- apply(knn, 1, function(x){mean(x.test[-ind,q.col][x,i])}) #Get the mean from the parsed KNN indices
+    
+    x.test[ind,q.col[i]] <- knn
+    print(i)
+  }
+
+```
+You might need to add it to x.test/train.weird after doing this
+
+What about a simple mean treatment?
+```{r}
+  x.train.zeros <- x.train[,q.col]
+  x.train.fix <- apply(x.train.zeros, 2, function(x){mu<-mean(x[-which(x==0)])
+                                                     x[which(x==0)] <- mu
+                                                     x})
+  x.train[,q.col] <- x.train.fix
+
+  x.test.zeros <- x.test[,q.col]
+  x.test.fix <- apply(x.test.zeros, 2, function(x){mu<-mean(x[-which(x==0)])
+                                                     x[which(x==0)] <- mu
+                                                     x})
+  x.test[,q.col] <- x.test.fix
+```
+
+PCA
+==========================
+Perform PCA on P-Variables
+```{r}
+  p.train <- train[,6:42]
+  p.test <- test[,6:42]
+  pca <- princomp(p.test)
+  summary(pca)
+  plot(pca)
+  cumvar <- cumsum(pca$sdev^2)/sum(pca$sdev^2)
+  plot(cumvar)
+  text(cumvar, labels=c(1:37),cex=0.7, pos=3)
+  abline(0.90,0)
+
+  # Get the first 25 PC.
+  pvar.pcomp <- predict(pca, p.test)[,1:20]
+  x.test <- test[,c(-1,-(6:42),-43)] # Remove ID column
+  x.test <- cbind(x.test, pvar.pcomp)
+
+```
+
+Miscellaneous
+===================
+
+Below is plot of extra values for P1:37 between Train dat
+```{r}
+
+for (i in 6:42){
+  buf <- c(buf, length(unique(test[,i]))-length(unique(train[,i])))
+}
+
+barplot(buf,names.arg=colnames(train)[6:42], main="Additional Discrete Data point (Test - Train)")
+```
+
+Prepare the data 
+```{r}
+
+y.train <- train[,43]
+x.train <- train[,c(-1,-43)] # Remove ID column
+x.train$Open.Date <- as.numeric(as.POSIXlt("01/01/2015", format="%m/%d/%Y") - as.POSIXlt(train$Open.Date, format="%m/%d/%Y"))
+x.test <- test[,-1] # Remove ID column
+x.test$Open.Date <- as.numeric(as.POSIXlt("01/01/2015", format="%m/%d/%Y") - as.POSIXlt(test$Open.Date, format="%m/%d/%Y"))
+
+# Feature addition
+x.train$Open.Month <- as.factor(format(as.POSIXlt(train$Open.Date, format="%m/%d/%Y"), "%m"))
+x.train$Open.Year <- as.numeric(format(as.POSIXlt(train$Open.Date, format="%m/%d/%Y"), "%Y"))
+x.test$Open.Month <- as.factor(format(as.POSIXlt(test$Open.Date, format="%m/%d/%Y"), "%m"))
+x.test$Open.Year <- as.numeric(format(as.POSIXlt(test$Open.Date, format="%m/%d/%Y"), "%Y"))
+```
+
+Linear Regression
+===================
+
+- Use Discrete or continuous for obfuscated code?  
+  - Continuous  
+- PCA? ICA? Reduce components?  
+  - No (t yet)  
+- How to deal with Disparity between Test set and Train set?  
+  - Run two regressions, one covering Disparity set and one not  
+- What is the correct type of model?
+  - Linear Regression in this case  
+
+```{r}
+
+linreg <- lm(y.train ~., data=x.train)
+summary(linreg)
+plot(linreg$residuals)
+print("RMSE Train: ")
+print(sqrt(mean(linreg$residuals^2)))
+
+x.test$City[!(x.test$City %in% x.train$City)] <- NA #Missing Data in trained model
+x.test$Type[x.test$Type == "MB"] <- NA
+head(x.test)
+
+```
+
+This brings the problem of missing data!
+
+```{r}
+# Train another Regression without it
+y.train.patrick <- train[,43]
+x.train.patrick <- train[,c(-1,-3,-5,-43)] # Remove ID column
+x.train.patrick$Open.Date <- as.numeric(as.POSIXlt("01/01/2015", format="%m/%d/%Y") - as.POSIXlt(train$Open.Date, format="%m/%d/%Y"))
+linreg.patrick <- lm(y.train.patrick ~., data=x.train.patrick)
+summary(linreg.patrick)
+print("RMSE Train: ")
+print(sqrt(mean(linreg.patrick$residuals^2)))
+```
+
+Now were ready for two regression, one without missing and trained for and one with missing data.
+
+```{r}
+pred.test <- c(1:100000) #constructed this way for a purpose
+patrick.pos <- which(is.na(x.test$City) | is.na(x.test$Type))
+squillam.pos <- !(pred.test %in% patrick.pos)
+
+x.test.patrick <- x.test[patrick.pos,c(-2,-4)]
+x.test.squillam <- x.test[squillam.pos,]
+
+pred.squillam <- as.vector(predict(linreg, x.test.squillam))
+pred.patrick <- as.vector(predict(linreg.patrick, x.test.patrick))
+
+pred.test[patrick.pos] <- pred.patrick
+pred.test[squillam.pos] <- pred.squillam
+hist(pred.test, breaks=100)
+```
+
+The City Problem
+==========
+
+Find best predictor of city
+
+```{r}
+cities <- unique(x.train$City)
+m <- lapply(cities, function(c){ apply(x.train[which(x.train$City == c),5:41], 2, mean)})
+m <- matrix(unlist(m), byrow=TRUE, ncol=37)
+boxplot(m)
+
+#Not getting good results from these below:
+trainIndex <- createDataPartition(y=x.test[,1], p = 0.1, list = FALSE)
+citypred <- x.test[trainIndex, c(2, 5:41)]
+citypred$City <- factor(citypred$City)
+tempcrap <- randomForest(citypred$City~., data=citypred[,-1], importance=T)
+varImpPlot(tempcrap)
+
+```
+
+Let's examine: P1, P2, P11, P19, P20, P23, P30
+```{r}
+source("db.r")
+
+e <- x.train[,c(2,5:6,15, 23:24,27,34)]
+
+dbind <- c()
+for(i in 2:30){
+  km <- kmeans(as.matrix(e[,-1]), i)
+  dbind <- c(dbind, DB(km$centers, km$withinss, i))
+  print(i)
+}
+
+plot(dbind)
+text(dbind, labels=c(2:50),cex=0.7, pos=3)
+
+```
+
+20 looks good, lets make a new training data set with the clusters
+
+```{r}
+
+
+k <- 20
+km <- cclust(as.matrix(e[,-1]), k)
+x.train.weird <- x.train
+x.train.weird$City <- km$cluster[1:nrow(x.train.weird)]
+
+#Applying to test set
+x.test.weird <- x.test
+x.test.cf <- x.test[,c(5:6,15, 23:24,27,34)]
+# Find the nearest cluster
+x.test.clusters <- predict(km, as.matrix(x.test.cf))$cluster
+x.test.weird$City <- x.test.clusters
+```
+
+Random Forest
+==================
+
+- Use Discrete or continuous for obfuscated code?  
+  - Continuous  
+- PCA? ICA? Reduce components?  
+  - No (t yet)  
+- How to deal with Disparity between Test set and Train set?  
+  - Going to try both dummy and factors  
+- What is the correct type of model?
+  - Random Forest 
+  
+```{r}
+
+
+trainIndex <- createDataPartition(y = y.train, p = 0.7, list = FALSE)
+x.prac <- x.train.weird[trainIndex, ]
+y.prac <- log(y.train[trainIndex])
+x.cv <- x.train.weird[-trainIndex, ]
+y.cv <- y.train[-trainIndex]
+
+#vec.cv.MAPE <- c()
+vec.cv.RMSE <- c()
+for (i in 1:100){
+
+  #Should we encode categorical?
+  #x.prac[,5:41] <- apply(x.prac[,5:41], 2, as.factor)
+  #x.cv[,5:41] <- apply(x.cv[,5:41], 2, as.factor)
+
+  rfmodelN <- randomForest(y.prac~., data = x.prac, importance=T)
+  
+  ### Get some info
+  #trainRMSE<-sqrt( mean( (y.prac-predict(rfmodelN, x.prac))^2 ) )
+  #vec.cv.MAPE <- c(vec.cv.MAPE, mean(abs((y.cv-predict(rfmodelN, x.cv))/y.cv))) 
+  res.rf <- (y.cv-exp(predict(rfmodelN, x.cv)))
+  vec.cv.RMSE <- c(vec.cv.RMSE, sqrt( mean( res.rf^2 ) ))
+}
+
+#hist(vec.cv.MAPE, breaks=30)
+hist(vec.cv.RMSE, breaks=50)
+
+varImp(rfmodelN)
+#pred.test.rf <- predict(rfmodelN, x.test)
+```
+
+Applying it to Test set
+
+```{r}
+  
+  rfmodelN <- randomForest(log(y.train)~., data = x.train.weird, importance=T)
+
+  pred.test <- as.vector(exp(predict(rfmodelN, x.test.weird)))
+```
+
+Neural Network & SVM
+-------------------------
+
+Set up Data and Design matrix since NN/SVM doesn't automatically support it
+```{r}
+
+  trainIndex <- createDataPartition(y = y.train, p = 0.7, list = FALSE)
+  y.prac <- y.train[trainIndex]
+  x.prac <- x.train.weird[trainIndex, ]
+  x.prac <- model.matrix(y.prac~., data=x.prac)[,-1] # Remove Intercept
+
+  y.cv <- y.train[-trainIndex]
+  x.cv <- x.train.weird[-trainIndex, ]
+  x.cv <- model.matrix(y.cv~., data=x.cv)[,-1] # Remove Intercept
+
+```
+
+Neural Network
+============================
+```{r}
+  #vec.cv.RMSE <- matrix(,ncol=2, nrow=30)
+
+  f <- as.formula(paste("y.prac ~ ", paste(dimnames(x.prac)[[2]], collapse="+"), sep=""))
+  nn <- neuralnet(f,data=x.prac, hidden=c(5,5), stepmax=1e8, lifesign="full")
+ # vec.cv.RMSE[i,1] <- 
+  (sqrt(mean((10*(y.prac-compute(nn, x.prac)$net.result))^2 ) ))
+  (sqrt(mean((10*(y.cv-compute(nn, x.cv)$net.result))^2 ) ))
+```
+The results show that it sucks
+
+SVM
+============================
+```{r}
+  scaling <- c(TRUE,TRUE,FALSE,FALSE,FALSE, rep(TRUE, 37), rep(FALSE,11), TRUE) # Scale variables?
+  
+  vec.cv.rmse <- c()
+  for (i in 1:100){
+    vm <- ksvm(x.prac, log(y.prac), type="eps-svr", kernel="rbfdot", scaled=scaling)
+    print((sqrt(mean((y.prac-exp(predict(vm, x.prac)))^2) ) ))
+    res.svm <- (y.cv-exp(predict(vm, x.cv)))
+    vec.cv.rmse[i] <- (sqrt(mean((y.cv-exp(predict(vm, x.cv)))^2) ) )
+  }
+  
+
+  hist(vec.cv.rmse, breaks=50)
+  (mean(vec.cv.rmse))
+```
+Scaling variables improve performance
+Better..
+
+Ensemble SVM + RF
+-------------------------------------
+
+Take the best predictor of 100 iter.  It's gonna over fit but fuck you
+```{r}
+rmse.cv.rf <- c()
+rmse.cv.svm <- c()
+rmse.t.svm <- c()
+vec.rf <- list()
+vec.svm <- list()
+
+for (i in 1:100){
+  
+  trainIndex <- createDataPartition(y = y.train, p = 0.95, list = FALSE)
+  x.prac <- x.train.weird[trainIndex, ]
+  y.prac <- y.train[trainIndex]
+  x.cv <- x.train.weird[-trainIndex, ]
+  y.cv <- y.train[-trainIndex]
+
+  ##################################RF#####################################
+  vec.rf[[i]] <- randomForest(y.prac~., data = x.prac, importance=T)
+  rmse.cv.rf[i] <- sqrt( mean( (y.cv-predict(vec.rf[[i]], x.cv))^2 ) )
+  ##################################RF#####################################
+  #################################SVM#####################################
+  x.prac <- model.matrix(y.prac~., data=x.prac)[,-1] # Remove Intercept
+  x.cv <- model.matrix(y.cv~., data=x.cv)[,-1] # Remove Intercept 
+  #scaling <- c(TRUE,TRUE,FALSE,FALSE,FALSE, rep(TRUE, 37), rep(FALSE,11), TRUE) # Scale variables? (OLD)
+  scaling <- c(TRUE,TRUE,FALSE,FALSE,FALSE, rep(TRUE, 20), rep(FALSE,11) , TRUE) # with PCOMP
+  vec.svm[[i]] <- ksvm(x.prac, y.prac, type="eps-svr", kernel="rbfdot", scaled=scaling)
+  rmse.cv.svm[i] <- (sqrt(mean((y.cv-predict(vec.svm[[i]] , x.cv))^2) ) )
+  rmse.t.svm[i] <- (sqrt(mean((y.cv-predict(vec.svm[[i]] , x.prac))^2) ) )
+  #################################SVM#####################################
+}
+
+  hist(rmse.cv.rf, breaks=40)
+  hist(rmse.cv.svm, breaks=40)
+  mean(rmse.cv.rf)
+  mean(rmse.cv.svm)
+```
+No Log
+> mean(rmse.cv.rf)
+[1] 2407323.027
+> mean(rmse.cv.svm)
+[1] 2345570.88
+
+With Log
+>   mean(rmse.cv.rf)
+[1] 2357575
+>   mean(rmse.cv.svm)
+[1] 2374560
+
+RF Log, SVM no log
+>   mean(rmse.cv.rf)
+[1] 2356355
+>   mean(rmse.cv.svm)
+[1] 2383124
+
+Take the best dude and train the entire test set.  Gotta take care of MB..
+
+The Mobile Problem
+====================
+Let's try KNN
+```{r}
+  ind.old <- c(-1,-3,-4,-42,-43) #Listing for old variables
+  ind.pcomp <- -c(1,3,4,26,25) #For test set
+  ind <- ind.old # Change as you go
+
+  query.matrix <- x.test.weird[x.test.weird$Type == "MB", ind] #Remove Factors + Open.Year +Open.date
+  knn <- knnx.index(x.test.weird[x.test.weird$Type != "MB",ind], query.matrix)
+  #nn.dist <- knnx.dist(x.test.weird[x.test.weird$Type != "MB",c(-1, -3,-4,-42,-43)], query.matrix)
+  nn.type <- t(apply(knn, 1, function(x){x.test.weird[x.test.weird$Type != "MB",]$Type[x]}))
+  MB.transform <- as.vector(apply(nn.type, 1, function(x){names(sort(table(x),decreasing=TRUE)[1])}))
+
+  x.test.weird$Type[x.test.weird$Type == "MB"] <- MB.transform
+  x.test.weird$Type <- factor(x.test.weird$Type)
+```
+
+```{r}
+#Do for entire set
+rmse.t.rf <- c()
+rmse.t.svm <- c()
+vec.rf <- list()
+vec.svm <- list()
+for (i in 1:100){
+  
+  x.prac <- x.train.weird
+  y.prac <- y.train
+
+  ##################################RF#####################################
+  vec.rf[[i]] <- randomForest(y.prac~., data = x.prac, importance=T)
+  rmse.t.rf[i] <- sqrt( mean( (y.prac-predict(vec.rf[[i]], x.prac))^2 ) )
+  ##################################RF#####################################
+  #################################SVM#####################################
+  x.prac <- model.matrix(y.prac~., data=x.prac)[,-1] # Remove Intercept
+  #scaling <- c(TRUE,TRUE,FALSE,FALSE,FALSE, rep(TRUE, 37), rep(FALSE,11), TRUE) # Scale variables? (OLD)
+  scaling <- c(TRUE,TRUE,FALSE,FALSE,FALSE, rep(TRUE, 20), rep(FALSE,11) , TRUE) # with PCOMP
+  vec.svm[[i]] <- ksvm(x.prac, y.prac, type="eps-svr", kernel="rbfdot", scaled=scaling)
+  rmse.t.svm[i] <- (sqrt(mean((y.prac-predict(vec.svm[[i]] , x.prac))^2) ) )
+  #################################SVM#####################################
+}
+  hist(rmse.t.rf, breaks=40)
+  hist(rmse.t.svm, breaks=40)
+  mean(rmse.t.rf)
+  mean(rmse.t.svm)
+
+  bestRF <- vec.rf[[which.min(rmse.t.rf)]]
+  bestSVM <- vec.svm[[which.min(rmse.t.svm)]]
+  (min(rmse.t.rf))
+  (min(rmse.t.svm))
+
+  alpha <- min(rmse.t.svm)/(min(rmse.t.svm)+min(rmse.t.rf)) #Shrinkage towards RF
+  alpha
+
+  pred.test <- alpha*predict(bestRF, x.test.weird) + 
+    (1-alpha)*predict(bestSVM, model.matrix(rep(0,100000)~., data=x.test.weird)[,-1])
+
+```
+  
